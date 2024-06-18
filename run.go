@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"time"
 
-	"github.com/xiaotushaoxia/ctxutils"
 	"github.com/xiaotushaoxia/errx"
 )
 
@@ -62,7 +62,6 @@ func (s *NetServer) RunListener(ctx context.Context, l net.Listener) error {
 
 	acceptErr := make(chan error, 1)
 	connCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	go func() {
 		if er := s.acceptLoop(connCtx, l); er != nil {
@@ -72,41 +71,22 @@ func (s *NetServer) RunListener(ctx context.Context, l net.Listener) error {
 
 	defer func() {
 		s.closeListener(l)
-		s.stop(cancel)
-		s.waitClientExit()
+		cancel()
+		s.cleanUp()
 	}()
 
 	select {
 	case <-ctx.Done():
-		s.logFunc("close listener because ctx done")
-		//// context.Cause(ctx) should eq to ctx.Err() or not nil. will fix in go1.22
-		//// https://github.com/golang/go/issues/62582
-		//return errx.WithMessage(ctx.Err(), "ctx done")
-		if er := context.Cause(ctx); er != nil {
-			// context.Cause(ctx) should eq to ctx.Err() or not nil. will fix in go1.22
-			// https://github.com/golang/go/issues/62582
-			return errx.WithMessage(er, "ctx done")
-		}
-		return errx.WithMessage(ctx.Err(), "ctx done")
+		er := getCtxCauseErr(ctx)
+		s.logFunc("close listener because ctx done: %s", er)
+		return errx.WithMessage(er, "ctx done")
 	case er := <-acceptErr:
-		s.logFunc("close listener because accept error %s", er)
+		s.logFunc("close listener because accept error: %s", er)
 		return errx.WithMessage(er, "accept error")
 	}
 }
 
 func (s *NetServer) acceptLoop(connCtx context.Context, l net.Listener) error {
-	//listener := newIgnoreTemporaryErrorListener(l)
-	//go listener.back(connCtx) // exit when accept error or connCtx done
-	//for {
-	//	select {
-	//	case err := <-listener.errCh:
-	//		// 如果err==nil, 表示是connCtx Done了
-	//		return err
-	//	case conn := <-listener.connCh:
-	//		go s.newConn(connCtx, s.count.Add(1), conn)
-	//	}
-	//}
-
 	delayer := retryDelay{maxDelay: time.Second, initDelay: time.Millisecond * 5}
 	for {
 		conn, er := l.Accept()
@@ -121,7 +101,7 @@ func (s *NetServer) acceptLoop(connCtx context.Context, l net.Listener) error {
 		default:
 		}
 		s.logFunc("accept error: %v", er)
-		if !IsTemporary(er) {
+		if !isTemporary(er) {
 			s.logFunc("not temporary error exit")
 			return er
 		}
@@ -134,54 +114,55 @@ func (s *NetServer) acceptLoop(connCtx context.Context, l net.Listener) error {
 	}
 }
 
-func (s *NetServer) newConn(connCtx context.Context, id uint64, conn net.Conn) {
-	head := getHead(id, conn)
-
-	s.logFunc("%s connected", head)
-	s.conns.Store(id, conn)
-	s.activeConn.Add(1)
-
-	wait := s.onShuttingDown(connCtx, id, conn)
-	s.HandleFunc(connCtx, conn)
-	wait()
-	s.logFunc("%s onShuttingDown finish", head)
-
-	s.logFunc("%s handle func exited", head)
-	s.activeConn.Add(^uint64(0)) // -1
-	s.conns.Delete(id)
-
-	s.logFunc("%s close. err: %v", head, SwallowErrClosed(conn.Close()))
+func (s *NetServer) newConn(root context.Context, id uint64, conn net.Conn) {
+	c := s.addConn(root, id, conn)
+	defer s.deleteConn(id, conn)
+	s.HandleFunc(c.Ctx, conn)
 }
 
-func (s *NetServer) onShuttingDown(connCtx context.Context, id uint64, conn net.Conn) (block func()) {
-	ctx, cancel := context.WithCancel(context.Background())
-	s.connShuttingDownCalled.Store(id, ctx)
-	if !s.closeWriteWhenShuttingDown && s.ShuttingDownHandleFunc == nil {
-		return func() {
-			noopFunc()
-			cancel()
-		}
+func (s *NetServer) addConn(root context.Context, id uint64, conn net.Conn) *ClientConn {
+	head := getName(id, conn)
+	ctx, cancelFunc := context.WithCancel(root)
+	s.logFunc("%s: connected", head)
+	var once sync.Once
+	cancelFunc2 := func() {
+		cancelFunc()
+		once.Do(func() {
+			s.cancelOneClient(id)
+		})
 	}
-	head := getHead(id, conn)
-	stopf, exit := ctxutils.AfterFunc(connCtx, func() {
-		if s.ShuttingDownHandleFunc != nil {
-			s.logFunc("%s exec ShuttingDownHandleFunc", head)
-			s.ShuttingDownHandleFunc(connCtx, conn)
+	c := &ClientConn{Conn: conn, Id: id, Ctx: ctx, Cancel: cancelFunc2, StartTime: time.Now()}
+	s.conns.Store(id, c)
+	s.activeConn.Add(1)
+	return c
+}
+
+func (s *NetServer) deleteConn(id uint64, conn net.Conn) {
+	head := getName(id, conn)
+	s.logFunc("%s: handle func exited", head)
+	s.activeConn.Add(^uint64(0)) // -1
+	s.conns.Delete(id)
+	// HandleFunc should call conn.Close. call twice to make sure conn is released
+	// fixme call Close twice looks make no side effects
+	s.logFunc("close %s at last. err: %v", head, swallowErrClosed(conn.Close()))
+	s.logFunc("%s: disconnected", head)
+}
+
+func (s *NetServer) cancelOneClient(id uint64) {
+	go func() {
+		fmt.Println("cancelOneClient", id)
+		s.waitOneClientExit(id, s.handleFuncCancelTimeout)
+		value, ok := s.conns.Load(id)
+		if !ok {
+			return
 		}
-		if s.closeWriteWhenShuttingDown {
-			s.logFunc("%s exec CloseWrite", head)
-			if cw, ok := conn.(closeWriter); ok {
-				err := cw.CloseWrite()
-				if err != nil {
-					s.logFunc("%s close write. err: %s", head, SwallowErrClosed(err))
-				}
-			}
+		if !s.forceCloseClientIfTimeout {
+			s.logFunc("warn: ForceCloseClientIfTimeout disabled. conn %d still alive", id)
+			return
 		}
-		cancel()
-	})
-	return func() {
-		stopf()
-		<-exit
-		cancel()
-	}
+		s.logFunc("ForceCloseClientIfTimeout enabled. try Close Conn and wait")
+		s.logFunc("close %s, err: %v", getName(value.Id, value.Conn), swallowErrClosed(value.Conn.Close()))
+		s.waitClientExit(s.closeClientTimeout)
+	}()
+
 }

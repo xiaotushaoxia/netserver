@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"netserver"
+
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +55,7 @@ func (m *Manger) newConn(ctx context.Context, conn net.Conn) {
 func (m *Manger) sendAll(from uint64, msg []byte) {
 	fmt.Printf("%d:%s", from, string(msg))
 
-	msg = append([]byte(fmt.Sprintf("%d说:", from)), msg...)
+	msg = append([]byte(fmt.Sprintf("%d said:", from)), msg...)
 	var needDelete []uint64
 	m.conns.Range(func(key uint64, conn net.Conn) (shouldContinue bool) {
 		if key == from {
@@ -63,7 +63,7 @@ func (m *Manger) sendAll(from uint64, msg []byte) {
 		}
 		_, err := conn.Write(msg)
 		if err != nil {
-			fmt.Println("write to ", key, "failed", err, "close. close err:", netserver.SwallowErrClosed(conn.Close()))
+			fmt.Println("write to ", key, "failed", err, "close. close err:", conn.Close())
 			needDelete = append(needDelete, key)
 		}
 		return true

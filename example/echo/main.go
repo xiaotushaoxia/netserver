@@ -28,10 +28,9 @@ func main() {
 
 	server := netserver.New(echo,
 		netserver.WithLogFunc(fmtLogFunc, true),
-		//netserver.WithCloseClientMode(netserver.CloseClientByCancelCtx),
-		netserver.WithCloseClientMode(netserver.CloseClientByCloseConn),
-		netserver.WithCloseClientTimeout(time.Second),
-		netserver.WithCloseWriteWhenShuttingDown(true),
+		netserver.WithCloseClientTimeout(time.Second*10),
+		netserver.WithHandleFuncCancelTimeout(time.Second*10),
+		netserver.WithForceCloseClientIfTimeout(true),
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -42,6 +41,10 @@ func main() {
 }
 
 func echo(ctx context.Context, conn net.Conn) {
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
 	written, err := io.Copy(conn, conn)
 	fmtLogFunc("echo done, copy %d, err: %s", written, err)
 }

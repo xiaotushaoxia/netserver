@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync/atomic"
 	"syscall"
 )
@@ -70,14 +71,18 @@ func (m *Proxy) handle(ctx context.Context, cl logger, client, backend *net.TCPC
 	}()
 
 	broker := func(dst *net.TCPConn, src *net.TCPConn, msg string) {
-		wrote, err := io.Copy(dst, src)
+		mm := "服务器->客户端"
+		if msg == "broker: client to backend" {
+			mm = "客户端->服务器"
+		}
+		wrote, err := io.Copy(io.MultiWriter(dst, &writeLogger{head: mm}), src)
 		// todo 这个行为不一定是正确的 我参考了 github.com/docker/go-connections的TCPProxy
 		if err != nil && isPeerCloseRead(err) { //
 			cl.Printf(" forward SHUT_WR to the other end of the pipe !!!!")
 			src.CloseRead()
 		}
 		dst.CloseWrite()
-		cl.Printf("Summary: %s %d bytes, exit err:%s", msg, wrote, err)
+		cl.Printf("Summary: %s %d bytes, exit err:%v", msg, wrote, err)
 		brokerExit <- msg
 	}
 
@@ -111,6 +116,18 @@ func (m *Proxy) handle(ctx context.Context, cl logger, client, backend *net.TCPC
 	cl.Printf("exit")
 }
 
+type writeLogger struct {
+	head string
+}
+
+func (w *writeLogger) Write(bs []byte) (int, error) {
+	ob := len(bs)
+	a := []byte("\n" + w.head + fmt.Sprintf(": %d:", len(bs)))
+	bs = []byte(fmt.Sprintf("% X", bs))
+	os.Stdout.Write(append(a, bs...))
+	return ob, nil
+}
+
 func isPeerCloseRead(err error) bool {
 	// github.com/docker/go-connections的TCPProxy这样做 但是好像是错误
 	// https://github.com/docker/go-connections/issues/110
@@ -134,6 +151,7 @@ func isPeerCloseRead(err error) bool {
 	// syscall.EPIPE 32 broken pipe
 	// syscall.ECONNRESET 104 connection reset by peer
 	if int(errno) == 10054 || int(errno) == 10053 || int(errno) == 32 || int(errno) == 104 {
+		// 不单独写_linux和_window文件了，直接两个放一起判断
 		return true
 	}
 	return false

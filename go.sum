@@ -4,7 +4,13 @@ github.com/xiaotushaoxia/ctxutils v0.0.0-20231127134555-7b146daa97e8 h1:VLjBvFPw
 github.com/xiaotushaoxia/ctxutils v0.0.0-20231127134555-7b146daa97e8/go.mod h1:jc6bolFKLCEh9fsgt0wMg4PCrSyFZLgBRtSvTT+QqGw=
 github.com/xiaotushaoxia/errx v0.0.0-20230402155036-d8f0b75a896f h1:UNJ+olDH+CzqxpM6arKxZ0hrkFMWPpBIg/ItlRCA1Xo=
 github.com/xiaotushaoxia/errx v0.0.0-20230402155036-d8f0b75a896f/go.mod h1:mJROG4ykVzq+0gBdFUywldtLKaiYB3b7JoXc0hKzaGo=
+github.com/xiaotushaoxia/errx v0.0.1 h1:j+izYfSfXGzYLa3es1aNP0g/VeXCmBMuEs1nYS0ipUg=
+github.com/xiaotushaoxia/errx v0.0.1/go.mod h1:mJROG4ykVzq+0gBdFUywldtLKaiYB3b7JoXc0hKzaGo=
 github.com/xiaotushaoxia/synccollections v0.0.0-20230402155213-57f4378ac575 h1:ouJmXdk070HRGkekuuVjtwbwUX4El3Squ5UabFin1Jc=
 github.com/xiaotushaoxia/synccollections v0.0.0-20230402155213-57f4378ac575/go.mod h1:XJQsTmCB7UdyUDDbgeh3Z/5fEKkMzfV9BiNiXWv8Gsw=
+github.com/xiaotushaoxia/synccollections v0.0.1 h1:GIbN7/6Is7gCBXUmzMWfhKSWgLu9TJr+tDelsywsHqw=
+github.com/xiaotushaoxia/synccollections v0.0.1/go.mod h1:XJQsTmCB7UdyUDDbgeh3Z/5fEKkMzfV9BiNiXWv8Gsw=
 golang.org/x/sync v0.5.0 h1:60k92dhOjHxJkrqnwsfl8KuaHbn/5dl0lUPUklKo3qE=
 golang.org/x/sync v0.5.0/go.mod h1:Czt+wKu1gCyEFDUtn0jG5QVvpJ6rzVqr5aXyt9drQfk=
+golang.org/x/sync v0.7.0 h1:YsImfSBoP9QPYL0xyKJPq0gcaJdG3rInoqxTWbfQu9M=
+golang.org/x/sync v0.7.0/go.mod h1:Czt+wKu1gCyEFDUtn0jG5QVvpJ6rzVqr5aXyt9drQfk=

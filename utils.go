@@ -12,45 +12,66 @@ import (
 	"github.com/xiaotushaoxia/errx"
 )
 
-func IsErrClosed(err error) bool {
+func isErrClosed(err error) bool {
 	return errors.Is(err, net.ErrClosed)
 }
 
 // ============= NetServer =============
 func (s *NetServer) closeListener(l net.Listener) {
 	closeErr := l.Close()
-	if closeErr != nil && !IsErrClosed(closeErr) {
+	if closeErr != nil && !isErrClosed(closeErr) {
 		s.logFunc("close listener err: %s", closeErr)
 	}
 }
 
-func (s *NetServer) stop(cancel context.CancelFunc) {
-	s.logFunc(string(s.closeClientMode))
-	defer s.logFunc("wait all conns exit")
-	if s.closeClientMode == CloseClientByCancelCtx {
-		cancel()
+func (s *NetServer) cleanUp() {
+	s.waitClientExit(s.handleFuncCancelTimeout)
+	if s.activeConn.Load() == 0 {
 		return
 	}
+	if !s.forceCloseClientIfTimeout {
+		s.logFunc("warn: ForceCloseClientIfTimeout disabled")
+		return
+	}
+	s.logFunc("ForceCloseClientIfTimeout enabled. try Close Conn and wait")
 
-	s.closeClientConns(false) // 这里关闭会等待onShuttingDown调用
+	s.conns.Range(func(key uint64, value *ClientConn) (shouldContinue bool) {
+		s.logFunc("close %s, err: %v", getName(value.Id, value.Conn), swallowErrClosed(value.Conn.Close()))
+		return true
+	})
+
+	s.waitClientExit(s.closeClientTimeout)
 }
 
-func (s *NetServer) waitClientExit() {
-	tctx, tcancel := context.WithTimeout(context.Background(), s.closeClientTimeout)
+func (s *NetServer) waitOneClientExit(cid uint64, timeout time.Duration) {
+	tctx, tcancel := context.WithTimeout(context.Background(), timeout)
 	defer tcancel()
-	if pollCheck(tctx, s.noActiveConn, s.showActiveConn) != nil {
-		s.logFunc("wait for %s, wont wait anymore, %d conns not exit", s.closeClientTimeout, s.activeConn.Load())
-		if s.closeClientMode != CloseClientByCancelCtx {
-			s.logFunc("cancel ctx and wait %s,  but not all clients, close conn force", s.closeClientTimeout)
-			s.closeClientConns(true) // 这里关闭会等待直接close conn
-		}
-	} else {
-		s.logFunc("all conns are exited")
+	if pollCheck(tctx, s.isClientExitedFunc(cid), func() {
+		s.logFunc("conn %d is alive", cid)
+	}) == nil {
+		return
 	}
+	s.logFunc("wait for %s, wont wait anymore, conn %d still alive", timeout, cid)
+}
+
+func (s *NetServer) waitClientExit(timeout time.Duration) {
+	tctx, tcancel := context.WithTimeout(context.Background(), timeout)
+	defer tcancel()
+	if pollCheck(tctx, s.noActiveConn, s.showActiveConn) == nil {
+		return
+	}
+	s.logFunc("wait for %s, wont wait anymore, %d conns still alive", timeout, s.activeConn.Load())
 }
 
 func (s *NetServer) noActiveConn() bool {
 	return s.activeConn.Load() == 0
+}
+
+func (s *NetServer) isClientExitedFunc(cid uint64) func() bool {
+	return func() bool {
+		_, ok := s.conns.Load(cid)
+		return !ok
+	}
 }
 
 func (s *NetServer) showActiveConn() {
@@ -64,8 +85,8 @@ func (s *NetServer) showActiveConn() {
 		s.logFunc("showActiveConn: %d active conns are running", s.activeConn.Load())
 	}
 
-	s.conns.Range(func(id uint64, conn net.Conn) bool {
-		s.logFunc("showActiveConn: %s is active", getHead(id, conn))
+	s.conns.Range(func(id uint64, conn *ClientConn) bool {
+		s.logFunc("showActiveConn: %s is active", getName(id, conn.Conn))
 		return true
 	})
 }
@@ -75,30 +96,6 @@ func (s *NetServer) setCtxCancel(ctx context.Context, cancel context.CancelFunc)
 	defer s.m.Unlock()
 	s.cancel = cancel
 	s.ctx = ctx
-}
-
-func (s *NetServer) closeClientConns(force bool) {
-	s.conns.Range(func(_id uint64, _conn net.Conn) bool {
-		go func(id uint64, conn net.Conn) {
-			h := getHead(id, conn)
-			if !force {
-				value, ok := s.connShuttingDownCalled.Load(id)
-				if !ok {
-					s.logFunc("warn: %s not found shutting down ctx", h)
-				} else {
-					s.logFunc("%s wait ShuttingDownHandleFunc call", h)
-					<-value.Done()
-					s.logFunc("%s ShuttingDownHandleFunc called", h)
-				}
-			}
-			s.connShuttingDownCalled.Delete(id)
-			s.logFunc("%s close", h)
-			if er := conn.Close(); er != nil && !IsErrClosed(er) {
-				s.logFunc("%s close error: %s", h, er)
-			}
-		}(_id, _conn)
-		return true
-	})
 }
 
 func (s *NetServer) getCtxCancel() (context.Context, context.CancelFunc) {
@@ -122,7 +119,7 @@ func (s *NetServer) wrapLogFunc(f func(string, ...any)) func(string, ...any) {
 // utils
 const shutdownPollIntervalMax = 1000 * time.Millisecond
 
-func pollCheck(ctx context.Context, check func() bool, print func()) error {
+func pollCheck(ctx context.Context, check func() bool, debugInfo func()) error {
 	pollIntervalBase := time.Millisecond * 10
 	nextPollInterval := func() time.Duration {
 		// Add 10% jitter.
@@ -140,8 +137,8 @@ func pollCheck(ctx context.Context, check func() bool, print func()) error {
 		if check() {
 			return nil
 		}
-		if print != nil {
-			print()
+		if debugInfo != nil {
+			debugInfo()
 		}
 		select {
 		case <-ctx.Done():
@@ -155,22 +152,6 @@ func pollCheck(ctx context.Context, check func() bool, print func()) error {
 	}
 }
 
-func isTemporaryAndGetNewDelay(oldDelay time.Duration, err error) (time.Duration, bool) {
-	// 抄的go net/http 中Accept出错的处理
-	if ne, ok := err.(net.Error); ok && ne.Temporary() {
-		if oldDelay == 0 {
-			oldDelay = 5 * time.Millisecond
-		} else {
-			oldDelay *= 2
-		}
-		if maxDelay := 1 * time.Second; oldDelay > maxDelay {
-			oldDelay = maxDelay
-		}
-		return oldDelay, true
-	}
-	return 0, false
-}
-
 func failedTo(err error, op string, args ...any) error {
 	if err == nil {
 		return nil
@@ -182,26 +163,14 @@ func noopLogFunc(string, ...any) {
 	return
 }
 
-type closeReader interface {
-	CloseRead() error
-}
-
-type closeWriter interface {
-	CloseWrite() error
-}
-
-var noopFunc = func() {
-	return
-}
-
 var closedChan = make(chan struct{})
 
 func init() {
 	close(closedChan)
 }
 
-func getHead(id uint64, conn net.Conn) string {
-	return fmt.Sprintf("conn %d[%s]:", id, conn.RemoteAddr())
+func getName(id uint64, conn net.Conn) string {
+	return fmt.Sprintf("conn %d [%s]", id, conn.RemoteAddr())
 }
 
 type noopLocker struct {
@@ -257,61 +226,32 @@ func (d *retryDelay) delay(ctx context.Context) (interrupted bool) {
 	}
 }
 
-type ignoreTemporaryErrorListener struct {
-	l      net.Listener
-	connCh chan net.Conn
-	errCh  chan error
-}
-
-func newIgnoreTemporaryErrorListener(l net.Listener) *ignoreTemporaryErrorListener {
-	a := ignoreTemporaryErrorListener{l: l, connCh: make(chan net.Conn, 1), errCh: make(chan error, 1)}
-	return &a
-}
-
-func (l *ignoreTemporaryErrorListener) back(ctx context.Context) {
-	delayer := retryDelay{maxDelay: time.Second, initDelay: time.Millisecond * 5}
-	for {
-		conn, er := l.l.Accept()
-		if er == nil {
-			delayer.reset()
-			l.connCh <- conn
-			continue
-		}
-		select {
-		case <-ctx.Done():
-			// ctx.Done() may eq to  errors.Is(er, net.IsErrClosed)
-			l.errCh <- nil
-			return
-		default:
-			fmt.Printf("accept error: %v\n", er)
-			if !IsTemporary(er) {
-				fmt.Printf("not temporary error exit\n")
-				l.errCh <- er
-				return
-			}
-			fmt.Printf("accept temporary error: retrying in %v\n", delayer.next())
-			delayer.delay(ctx)
-		}
-	}
-
-}
-
-// IsTemporary
+// isTemporary
 // 本来应该是if ne, ok := er.(net.Error); ok && ne.Temporary()，但是Deprecated的提醒有点烦
 // Temporary虽然Deprecated了，但是net.http还在用，而且确实有error是Temporary的，比如too many open file
-func IsTemporary(err error) bool {
+func isTemporary(err error) bool {
 	if ne, ok := err.(interface{ Temporary() bool }); !ok && !ne.Temporary() {
 		return false
 	}
 	return true
 }
 
-func SwallowErrClosed(err error) error {
+func swallowErrClosed(err error) error {
 	if err == nil {
 		return nil
 	}
-	if IsErrClosed(err) {
+	if isErrClosed(err) {
 		return nil
 	}
 	return err
+}
+
+func getCtxCauseErr(ctx context.Context) error {
+	//// context.Cause(ctx) should eq to ctx.Err() or not nil. will fix in go1.22
+	//// https://github.com/golang/go/issues/62582
+	//return errx.WithMessage(ctx.Err(), "ctx done")
+	if er := context.Cause(ctx); er != nil {
+		return er
+	}
+	return ctx.Err()
 }
