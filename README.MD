@@ -33,10 +33,7 @@ func main() {
 
 	server := netserver.New(echo,
 		netserver.WithLogFunc(fmtLogFunc, true),
-		//netserver.WithCloseClientMode(netserver.CloseClientByCancelCtx),
-		netserver.WithCloseClientMode(netserver.CloseClientByCloseConn),
 		netserver.WithCloseClientTimeout(time.Second),
-		netserver.WithCloseWriteWhenShuttingDown(true),
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
